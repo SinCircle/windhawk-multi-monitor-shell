@@ -43,3 +43,15 @@ Windhawk and its compiler/runtime are external dependencies and are not bundled 
 - License: GNU General Public License v3.0, explicitly stated in the upstream source.
 - Reused approach: scope CToastCenterExperienceManager::PositionView and redirect its primary MonitorFromPoint query.
 - Changes: thread-local nested scope, capture target before native positioning, checked monitor lookup, independent switches, native layout and animations, Win+N routing verified using the local Microsoft PDB, integration tests. No upstream corner-positioning or XAML animation code is included.
+
+## Win+D per monitor
+
+- Author: easyatm and contributors.
+- Version: 1.3.260330, retrieved 2026-10-13.
+- Source: https://github.com/ramensoftware/windhawk-mods/blob/df4fa4ff702cbeb34e8ec0eb2e1ae65dd3e26767/mods/win-d-per-monitor.wh.cpp
+- Input SHA-256: `953D0DBC29CE70D4097EFFA126960FC0FA7896F1B073090442CD142C349C772B`.
+- License: MIT, according to the repository's default-license rule for sources without an explicit license, verified 2026-10-13.
+- Reference: Explorer's `CTray::_HandleGlobalHotkey` entry point and Win+D hotkey ID `0x201`. The local hook preserves the member function's `this` pointer and both explicit arguments.
+- Independently implemented: per-monitor restore batches, window identity properties, original-minimized and maximized-state preservation, owner-group isolation across displays, failure handling and unloading. No upstream logging library, title rules, topmost toggling or window-size filters are included.
+
+Copyright (c) easyatm and contributors. The MIT permission and warranty notice reproduced above applies to this upstream reference as well, and is also retained in the single-file source.

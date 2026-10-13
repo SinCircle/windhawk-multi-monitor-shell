@@ -29,7 +29,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc != 3) return 2;
     std::ifstream input{std::filesystem::path(argv[2])};
     for (std::string line; std::getline(input, line);) if (!line.empty()) missing.insert(line);
-    if (missing.size() != 13) return 3;
+    if (missing.size() != 14) return 3;
     wchar_t system[MAX_PATH]{};
     if (!GetSystemDirectoryW(system, MAX_PATH)) return 4;
     auto dll = std::filesystem::path(system) / L"twinui.pcshell.dll";
@@ -43,9 +43,22 @@ int wmain(int argc, wchar_t** argv) {
         SymCleanup(process);
         return 6;
     }
+    if (missing.size() != 1 || missing.begin()->find("CTray::_HandleGlobalHotkey") == std::string::npos) {
+        for (auto& name : missing) std::printf("MISSING FROM SHELL: %s\n", name.c_str());
+        SymCleanup(process);
+        return 7;
+    }
+    wchar_t windows[MAX_PATH]{};
+    if (!GetWindowsDirectoryW(windows, MAX_PATH)) return 8;
+    auto explorer = std::filesystem::path(windows) / L"explorer.exe";
+    auto explorerBase = SymLoadModuleExW(process, nullptr, explorer.c_str(), nullptr, 0, 0, nullptr, 0);
+    if (!explorerBase || !SymEnumSymbols(process, explorerBase, "*", Found, nullptr)) {
+        SymCleanup(process);
+        return 9;
+    }
     for (auto& name : missing) std::printf("MISSING: %s\n", name.c_str());
     SymCleanup(process);
     if (!missing.empty()) return 1;
-    std::puts("PASS: all 13 required Win11 symbols match; no hooks were installed.");
+    std::puts("PASS: all 14 required Win11 symbols match in their expected modules; no hooks were installed.");
     return 0;
 }

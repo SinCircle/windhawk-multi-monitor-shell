@@ -1,24 +1,25 @@
 // ==WindhawkMod==
 // @id              multi-monitor-shell
 // @name            Multi-monitor Shell
-// @name:zh-CN      多屏随行：Alt+Tab、开始菜单与通知
-// @description     Choose the display for Alt+Tab, Start, notification banners and the notification center.
-// @description:zh-CN 让 Alt+Tab、开始菜单、通知横幅和 Win+N 通知中心跟随鼠标屏幕。
-// @version         0.2.0
-// @author          SinCircle; Local integration; L3r0y and m417z (upstream)
+// @name:zh-CN      多屏随行：Alt+Tab、开始菜单、通知与桌面
+// @description     Per-monitor Alt+Tab, Start, notifications, and Win+D show desktop.
+// @description:zh-CN 让 Alt+Tab、开始菜单与通知跟随鼠标屏幕，Win+D 仅最小化或恢复当前屏幕的窗口。
+// @version         0.3.0
+// @author          SinCircle; Local integration; L3r0y, m417z and easyatm (upstream)
 // @include         explorer.exe
 // @architecture    amd64
-// @compilerOptions -lole32 -loleaut32 -lversion
+// @compilerOptions -lole32 -loleaut32 -lversion -ldwmapi
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
-// Integration and changes: 2026-10-08. This combined work is GPL-3.0-only.
+// Integration and changes: 2026-10-13. This combined work is GPL-3.0-only.
 // Start routing is adapted from m417z's start-menu-open-location v1.0 (GPL-3.0).
 // Alt+Tab is adapted from L3r0y's alt-tab-per-monitor v1.2 (MIT).
 // Upstream: https://github.com/ramensoftware/windhawk-mods/tree/main/mods
 //
-// MIT notice for the Alt+Tab portions:
+// MIT notice for the Alt+Tab portions and Win+D upstream reference:
 // Copyright (c) L3r0y and contributors
+// Copyright (c) easyatm and contributors
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
@@ -39,19 +40,20 @@
 /*
 # 多屏随行 / Multi-monitor Shell
 
-一个独立模组，统一管理 Alt+Tab、开始菜单和通知出现在哪块屏幕。
+一个独立模组，统一管理 Alt+Tab、开始菜单、通知和 Win+D 的作用屏幕。
 
 - Alt+Tab 默认跟随鼠标，只列出该屏幕的窗口。
 - Win+Alt+Tab 默认在主屏显示所有屏幕的窗口。
 - 开始菜单默认跟随鼠标，也可以指定主屏或固定显示器。
 - 通知横幅和 Win+N 通知中心默认跟随鼠标，保留系统原生布局。
-- 四项功能可单独开关；保存设置会重新加载本模组。
+- Win+D 仅最小化鼠标所在屏幕的应用窗口，再按一次恢复这一批窗口。
+- 五项功能可单独开关；保存设置会重新加载本模组。
 
 开始菜单使用 Windows 原生布局，不修改固定应用、账户或搜索内容。
 鼠标屏幕在开始菜单打开时选取，不会在打开后追着鼠标移动。
 
 启用前关闭原版 **Alt+Tab per monitor** 和 **Start menu open location**，
-以及 **Customize Windows notifications placement**，以免同时修改相同系统函数。
+以及 **Customize Windows notifications placement**、**Win+D per monitor**，以免同时修改相同系统函数。
 需要恢复时关闭本模组并重新开启原版即可。
 
 目标平台：Windows 11 x64。使用系统内部符号，Windows 更新后可能需要适配。
@@ -121,6 +123,14 @@
 - notificationMonitorInterfaceName: ""
   $name: "通知：显示器接口名称（可选）"
   $description: 仅“指定显示器”生效。名称或片段优先于序号；目标不可用时保持系统行为。
+- showDesktopEnabled: true
+  $name: 启用 Win+D 单屏显示桌面
+  $description: 再按一次只恢复本次最小化的窗口；原本已经最小化的窗口保持不动。关闭或重载模组会恢复仍由本功能管理的窗口。
+- showDesktopLocation: cursor
+  $name: "Win+D：作用屏幕"
+  $options:
+  - cursor: 鼠标所在屏幕
+  - foreground: 当前活动窗口所在屏幕
 */
 // ==/WindhawkModSettings==
 
@@ -128,6 +138,11 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <map>
+#include <mutex>
+#include <set>
+#include <vector>
+#include <dwmapi.h>
 #include <winrt/windows.foundation.collections.h>
 
 namespace AltTab {
@@ -919,11 +934,256 @@ BOOL Init(HMODULE shell, bool toast, bool center) {
 }
 }  // namespace Notifications
 
+namespace ShowDesktop {
+// The Win+D hotkey ID and Explorer entry point were identified in easyatm's
+// win-d-per-monitor v1.3.260330. The per-monitor transaction below is independent.
+// Unlike a two-argument free function, this member method has a this pointer
+// AND both hotkey arguments. Preserve all three for unrelated shortcuts.
+using Hotkey_t = void(__cdecl*)(void*, WPARAM, LPARAM);
+Hotkey_t HotkeyOriginal;
+constexpr WPARAM kWinD = 0x201;
+constexpr PCWSTR kProperty = L"Windhawk.MultiMonitorShell.ShowDesktop";
+constexpr ULONGLONG kPendingMilliseconds = 1000;
+bool useForeground = false;
+bool unloading = false;
+std::mutex mutex;
+ULONG_PTR nextMarker = 0;
+
+struct Window {
+    HWND hwnd = nullptr;
+    DWORD processId = 0;
+    DWORD threadId = 0;
+    UINT restoreCommand = SW_SHOWNOACTIVATE;
+    HANDLE marker = nullptr;
+};
+struct Batch {
+    HMONITOR monitor = nullptr;
+    HWND foreground = nullptr;
+    ULONGLONG requestedAt = 0;
+    std::vector<Window> windows;
+};
+std::map<HMONITOR, Batch> batches;
+
+HMONITOR WindowMonitor(HWND hwnd) {
+    return MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+}
+bool VisibleOnDesktop(HWND hwnd) {
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+    DWORD cloaked = 0;
+    // If the compositor cannot identify a window, leave it alone.
+    return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
+                                           sizeof(cloaked))) && !cloaked;
+}
+
+HWND RootOwner(HWND hwnd) {
+    // GA_ROOTOWNER follows GetParent, which omits owners of overlapped windows.
+    // GW_OWNER also covers non-popup owned windows that hide with their owner.
+    for (int depth = 0; depth < 64; ++depth) {
+        HWND owner = GetWindow(hwnd, GW_OWNER);
+        if (!owner) return hwnd;
+        if (owner == hwnd) return nullptr;
+        hwnd = owner;
+    }
+    return nullptr;
+}
+
+bool CollectWindows(HMONITOR target, std::vector<Window>& result) {
+    struct Entry { HWND hwnd; HWND owner; HMONITOR monitor; };
+    std::vector<Entry> visible;
+    if (!EnumWindows([](HWND hwnd, LPARAM data) -> BOOL {
+            if (!VisibleOnDesktop(hwnd)) return TRUE;
+            auto& list = *reinterpret_cast<std::vector<Entry>*>(data);
+            list.push_back({hwnd, RootOwner(hwnd), WindowMonitor(hwnd)});
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&visible))) return false;
+
+    // Minimizing an owner also hides its owned dialogs. Do not minimize that
+    // owner if any visible member of its ownership group is on another screen.
+    std::set<HWND> crossMonitorOwners;
+    for (const auto& entry : visible) {
+        if (entry.monitor != target && entry.owner && entry.owner != entry.hwnd)
+            crossMonitorOwners.insert(entry.owner);
+    }
+    for (const auto& entry : visible) {
+        if (entry.monitor != target || entry.owner != entry.hwnd ||
+            crossMonitorOwners.contains(entry.hwnd)) continue;
+        const auto style = GetWindowLongPtrW(entry.hwnd, GWL_STYLE);
+        const auto exStyle = GetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE);
+        if (!(style & WS_MINIMIZEBOX) || (style & WS_CHILD) ||
+            (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE))) continue;
+        WCHAR className[128]{};
+        if (!GetClassNameW(entry.hwnd, className, ARRAYSIZE(className))) continue;
+        if (!wcscmp(className, L"Progman") || !wcscmp(className, L"WorkerW") ||
+            !wcscmp(className, L"Shell_TrayWnd") ||
+            !wcscmp(className, L"Shell_SecondaryTrayWnd")) continue;
+        WINDOWPLACEMENT placement{sizeof(placement)};
+        if (!GetWindowPlacement(entry.hwnd, &placement)) continue;
+        Window window;
+        window.hwnd = entry.hwnd;
+        window.threadId = GetWindowThreadProcessId(entry.hwnd, &window.processId);
+        if (!window.threadId) continue;
+        window.restoreCommand = placement.showCmd == SW_SHOWMAXIMIZED
+                                    ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE;
+        result.push_back(window);
+    }
+    return true;
+}
+
+bool SameWindow(const Window& window) {
+    DWORD processId = 0;
+    const DWORD threadId = GetWindowThreadProcessId(window.hwnd, &processId);
+    return threadId && threadId == window.threadId && processId == window.processId;
+}
+bool MarkWindow(Window& window) {
+    if (!SameWindow(window) || GetPropW(window.hwnd, kProperty)) return false;
+    if (!nextMarker) nextMarker = static_cast<ULONG_PTR>(GetTickCount64()) | 1;
+    window.marker = reinterpret_cast<HANDLE>(++nextMarker);
+    return SetPropW(window.hwnd, kProperty, window.marker) != FALSE;
+}
+bool OwnsWindow(const Window& window) {
+    // Properties disappear when a HWND is destroyed, protecting against handle
+    // reuse even when the new window belongs to the same process and thread.
+    return SameWindow(window) && window.marker &&
+           GetPropW(window.hwnd, kProperty) == window.marker;
+}
+void ForgetWindow(const Window& window) {
+    if (OwnsWindow(window)) RemovePropW(window.hwnd, kProperty);
+}
+
+// Effects are injectable so the restore state machine can be tested without
+// minimizing any user windows. Production uses the Win32 functions below.
+struct Api {
+    bool (*collect)(HMONITOR, std::vector<Window>&) = CollectWindows;
+    bool (*mark)(Window&) = MarkWindow;
+    bool (*owns)(const Window&) = OwnsWindow;
+    void (*forget)(const Window&) = ForgetWindow;
+    HMONITOR (*monitor)(HWND) = WindowMonitor;
+    decltype(&IsIconic) iconic = IsIconic;
+    decltype(&ShowWindowAsync) show = ShowWindowAsync;
+    decltype(&GetForegroundWindow) foreground = GetForegroundWindow;
+    decltype(&SetForegroundWindow) focus = SetForegroundWindow;
+    decltype(&GetTickCount64) now = GetTickCount64;
+} api;
+
+bool Pending(const Batch& batch) {
+    return api.now() - batch.requestedAt < kPendingMilliseconds;
+}
+void Prune() {
+    for (auto group = batches.begin(); group != batches.end();) {
+        auto& batch = group->second;
+        for (auto it = batch.windows.begin(); it != batch.windows.end();) {
+            if (!api.owns(*it) || api.monitor(it->hwnd) != batch.monitor ||
+                (!api.iconic(it->hwnd) && !Pending(batch))) {
+                api.forget(*it);
+                it = batch.windows.erase(it);
+            } else ++it;
+        }
+        if (batch.windows.empty()) group = batches.erase(group);
+        else ++group;
+    }
+}
+
+void Restore(Batch& batch) {
+    HWND focus = nullptr;
+    // Enumeration is top-to-bottom; restore from bottom to top. Never use
+    // TOPMOST/NOTOPMOST tricks, which would change an app's always-on-top state.
+    for (auto it = batch.windows.rbegin(); it != batch.windows.rend(); ++it) {
+        if (api.owns(*it) && api.monitor(it->hwnd) == batch.monitor &&
+            (api.iconic(it->hwnd) || Pending(batch))) {
+            // A quick second press also queues a restore behind an outstanding
+            // async minimize request instead of losing that window's record.
+            if (api.show(it->hwnd, static_cast<int>(it->restoreCommand))) {
+                if (it->hwnd == batch.foreground) focus = it->hwnd;
+            }
+        }
+        api.forget(*it);
+    }
+    if (focus) api.focus(focus);
+}
+
+void ToggleMonitor(HMONITOR monitor) {
+    std::lock_guard lock(mutex);
+    if (unloading || !monitor) return;
+    Prune();
+    if (auto existing = batches.find(monitor); existing != batches.end()) {
+        Restore(existing->second);
+        batches.erase(existing);
+        return;
+    }
+    std::vector<Window> candidates;
+    if (!api.collect(monitor, candidates) || candidates.empty()) return;
+    auto& batch = batches[monitor];
+    batch.monitor = monitor;
+    batch.foreground = api.foreground();
+    batch.requestedAt = api.now();
+    for (auto& window : candidates) {
+        // Recheck after enumeration; a user or app may have changed its state.
+        if (api.iconic(window.hwnd) || api.monitor(window.hwnd) != monitor ||
+            !api.mark(window)) continue;
+        batch.windows.push_back(window);
+        if (!api.show(window.hwnd, SW_MINIMIZE)) {
+            api.forget(window);
+            batch.windows.pop_back();
+        }
+    }
+    if (batch.windows.empty()) batches.erase(monitor);
+}
+
+HMONITOR SelectMonitor() {
+    HMONITOR monitor = nullptr;
+    if (useForeground) {
+        if (HWND foreground = GetForegroundWindow()) monitor = WindowMonitor(foreground);
+    } else {
+        POINT cursor{};
+        if (GetCursorPos(&cursor)) monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    }
+    MONITORINFO info{sizeof(info)};
+    return monitor && GetMonitorInfoW(monitor, &info) &&
+                   info.rcMonitor.right > info.rcMonitor.left &&
+                   info.rcMonitor.bottom > info.rcMonitor.top ? monitor : nullptr;
+}
+
+void __cdecl HotkeyHook(void* self, WPARAM hotkey, LPARAM details) {
+    if (hotkey != kWinD) {
+        HotkeyOriginal(self, hotkey, details);
+        return;
+    }
+    // No global fallback: failure to determine one monitor must never minimize
+    // the user's windows on all screens while this feature is enabled.
+    try { ToggleMonitor(SelectMonitor()); }
+    catch (...) { Wh_Log(L"Win+D monitor operation failed; global action suppressed."); }
+}
+
+BOOL Init() {
+    PCWSTR location = Wh_GetStringSetting(L"showDesktopLocation");
+    useForeground = location && wcscmp(location, L"foreground") == 0;
+    Wh_FreeStringSetting(location);
+    HMODULE explorer = GetModuleHandleW(nullptr);
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {{LR"(protected: void __cdecl CTray::_HandleGlobalHotkey(unsigned __int64,__int64))"},
+         &HotkeyOriginal, HotkeyHook},
+    };
+    return explorer && WindhawkUtils::HookSymbols(explorer, hooks, ARRAYSIZE(hooks));
+}
+
+void Shutdown() {
+    std::lock_guard lock(mutex);
+    unloading = true;
+    for (auto& [monitor, batch] : batches) Restore(batch);
+    batches.clear();
+}
+}  // namespace ShowDesktop
+
 BOOL Wh_ModInit() {
     const bool altTabEnabled = Wh_GetIntSetting(L"altTabEnabled") != 0;
     const bool startMenuEnabled = Wh_GetIntSetting(L"startMenuEnabled") != 0;
     const bool toastEnabled = Wh_GetIntSetting(L"notificationToastEnabled") != 0;
     const bool centerEnabled = Wh_GetIntSetting(L"notificationCenterEnabled") != 0;
+    const bool desktopEnabled = Wh_GetIntSetting(L"showDesktopEnabled") != 0;
+    if (desktopEnabled && !ShowDesktop::Init()) {
+        Wh_Log(L"Win+D symbols unavailable; initialization stopped.");
+        return FALSE;
+    }
     if (!altTabEnabled && !startMenuEnabled && !toastEnabled && !centerEnabled) return TRUE;
     // Explorer owns this module. Do not add a reference on every settings reload.
     HMODULE shell = GetModuleHandleW(L"twinui.pcshell.dll");
@@ -944,6 +1204,10 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
     return TRUE;
+}
+
+void Wh_ModBeforeUninit() {
+    ShowDesktop::Shutdown();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* reload) {

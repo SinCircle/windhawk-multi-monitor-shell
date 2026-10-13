@@ -5,7 +5,8 @@ param(
     [ValidatePattern('^(local@)?[a-z0-9-]+$')]
     [string]$RuntimeModId = 'multi-monitor-shell',
     [switch]$Test,
-    [switch]$CheckSymbols
+    [switch]$CheckSymbols,
+    [switch]$TestWindowFixtures
 )
 $ErrorActionPreference = 'Stop'
 if (-not $WindhawkRoot) {
@@ -37,7 +38,7 @@ $taskBaseFlags = @('-x','c++','-std=c++23','-target','x86_64-w64-mingw32',
     '-Wno-pragma-system-header-outside-header',
     '-I',(Join-Path $taskCompiler 'include'))
 $taskLibraries = @('-L',(Join-Path $taskCompiler 'lib'),'-lc++','-lunwind',
-    '-lole32','-loleaut32','-lversion')
+    '-lole32','-loleaut32','-lversion','-ldwmapi')
 $taskSource = Join-Path $PSScriptRoot 'multi-monitor-shell.wh.cpp'
 $taskVersionMatch = [regex]::Match((Get-Content -LiteralPath $taskSource -Raw), '(?m)^// @version\s+(\S+)')
 if (-not $taskVersionMatch.Success) { throw 'Mod version not found.' }
@@ -59,6 +60,17 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Test compilation failed: $LASTEXITCODE" }
         & $taskTestExe
         if ($LASTEXITCODE -ne 0) { throw "Routing tests failed: $LASTEXITCODE" }
+    }
+    if ($Test -or $TestWindowFixtures) {
+        $taskDesktopExe = Join-Path $BuildDirectory 'test-show-desktop.exe'
+        & $taskClang @taskBaseFlags '-DWH_EDITING' '-O1' (Join-Path $PSScriptRoot 'tests\test-show-desktop.cpp') `
+            @taskLibraries '-o' $taskDesktopExe
+        if ($LASTEXITCODE -ne 0) { throw "Desktop test compilation failed: $LASTEXITCODE" }
+        if ($Test) { & $taskDesktopExe; if ($LASTEXITCODE -ne 0) { throw 'Desktop tests failed.' } }
+        if ($TestWindowFixtures) {
+            & $taskDesktopExe '--window-fixtures'
+            if ($LASTEXITCODE -ne 0) { throw 'Native window fixture tests failed.' }
+        }
     }
     if ($CheckSymbols) {
         $taskSymbolCache = Join-Path $BuildDirectory 'symbols'
