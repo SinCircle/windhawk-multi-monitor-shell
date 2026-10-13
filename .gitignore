@@ -1,0 +1,6 @@
+/work/
+*.dll
+*.exe
+*.pdb
+*.zip
+__pycache__/
